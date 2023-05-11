@@ -1,124 +1,186 @@
-import os
-import logging
-from typing import List, Optional
-
-import boto3
+""" Assemble pb to parquet dataframes, one per day """
+import sys
+from google.protobuf.json_format import MessageToJson
 import json
+from google.transit import gtfs_realtime_pb2
+from io import BytesIO
+import boto3
 import pandas as pd
 import pendulum
 
-# use for dev, but don't deploy to Lambda:
-# from dotenv import load_dotenv
-# load_dotenv()
 
-logger = logging.getLogger()
-logger.setLevel(logging.INFO)
+class GTFSdata:
+    def __init__(self):
+        self.s3 = boto3.resource("s3")
+        self.bucket = self.s3.Bucket("rtd-ghost-buses-private")
 
-BUCKET_PRIVATE = os.getenv("BUCKET_PRIVATE")
-BUCKET_PUBLIC = os.getenv("BUCKET_PUBLIC")
+    trip_descriptor_message = {
+        "trip_id": str,
+        "route_id": str,
+        "direction_id": int,
+        "start_time": str,
+        "start_date": str,
+        "schedule_relationship": str,
+    }
 
-logger = logging.getLogger()
-logging.basicConfig(level=logging.INFO)
+    # https://developers.google.com/transit/gtfs-realtime/guides/feed-entities
 
+    def gtfs_decode(self, pb_message):
+        """RTD uses three protobuf message types. This returns an object of the correct type with the file read in"""
+        match self.data_type:
+            case "Alerts":
+                try:
+                    alert = gtfs_realtime_pb2.FeedMessage()
+                    alert.ParseFromString(pb_message)
+                    return alert
+                except:
+                    return None
+            case "TripUpdate":
+                try:
+                    trip_update = gtfs_realtime_pb2.FeedMessage()
+                    trip_update.ParseFromString(pb_message)
+                    return trip_update
+                except:
+                    return None
+            case "VehiclePosition":
+                try:
+                    vehicle_position = gtfs_realtime_pb2.FeedMessage()
+                    vehicle_position.ParseFromString(pb_message)
+                    return vehicle_position
+                except:
+                    return None
+            case _:
+                return "Command not recognized"
 
-def combine_daily_files(date: str, bucket_list: List[str], save: Optional[str] = None):
-    """Combine raw JSON files returned by API into daily CSVs. 
+    @staticmethod
+    def entity_to_dataframe(message, filename):
+        """Convert one decoded message to a pandas dataframe"""
+        if message is None:
+            return None
+        if len(message.entity) == 0:
+            return None
+        dataframe_rows = []
+        for entity in message.entity:
+            row = pd.json_normalize(json.loads(MessageToJson(entity)))
+            dataframe_rows.append(row)
 
-    Args:
-        date: Date string for which raw JSON files should be combined into CSVs. Format: YYYY-MM-DD.
-    """
-    s3 = boto3.resource("s3")
+        message_df = pd.concat(dataframe_rows)
+        message_df["header.timestamp"] = pd.Timestamp.utcfromtimestamp(
+            message.header.timestamp
+        )
+        message_df["filename"] = filename
+        return message_df
 
-    for bucket_name in bucket_list:
-        logging.info(f"processing data from {bucket_name}")
-        bucket = s3.Bucket(bucket_name)
-        objects = bucket.objects.filter(Prefix=f"bus_data/{date}")
-        logging.info(f"loaded objects to process for {date}")
+    def dataset_to_dataframe(self):
+        """Convert the entire decoded dataset"""
+        entire_dataframe_rows = []
+        for k, v in self.data_dict_decoded.items():
+            entire_dataframe_rows.append(self.entity_to_dataframe(v, k))
+        self.dataset_df = pd.concat(entire_dataframe_rows)
+        return None
 
-        data_list = []
-        errors_list = []
-        counter = 0
+    def decode_s3_data(self):
+        """Apply gtfs_decode tp a dict"""
+        self.data_dict_decoded = {
+            k: self.gtfs_decode(v) for k, v in self.data_dict.items()
+        }
+        # self.data_dict_decoded = dict(self.data_dict, map(gtfs_decode, self.data_dict.values()))
+
+        return None
+
+    def fetch_s3_data(self, day):
+        """Given a date range, fetch the un-decoded files"""
+
+        date_str = day.to_date_string()
+        print(f"Processing {date_str} at {pendulum.now().to_datetime_string()}")
+        # Prefix
+        objects = self.bucket.objects.filter(
+            Prefix=f"bus_data_{self.data_type}/{date_str}"
+        )
+
+        print(f"------- loading data at {pendulum.now().to_datetime_string()}")
+
+        # load data
+        data_dict = {}
+
         for obj in objects:
-            counter += 1
-            if counter % 20 == 0:
-                logger.info(f"processing object # {counter}") 
+            print(f"loading {obj}")
             obj_name = obj.key
-            # https://stackoverflow.com/questions/31976273/open-s3-object-as-a-string-with-boto3
-            obj_body = json.loads(obj.get()["Body"].read().decode("utf-8"))
+            obj_body = obj.get()["Body"].read()
+            data_dict[obj_name] = obj_body
 
-            new_data = pd.DataFrame()
-            new_errors = pd.DataFrame()
+        self.data_dict = data_dict
 
-            # expect ~12 "chunks" per JSON
-            for chunk in obj_body.keys():
-                if "vehicle" in obj_body[chunk]["bustime-response"].keys():
-                    new_data = pd.concat(
-                        [
-                        new_data, 
-                            pd.DataFrame(
-                                obj_body[chunk]["bustime-response"]["vehicle"]
-                            ),
-                        ],
-                        ignore_index=True,
-                    )
-                if "error" in obj_body[chunk]["bustime-response"].keys():
-                    new_errors = pd.concat(
-                        [
-                        new_errors,
-                            pd.DataFrame(obj_body[chunk]["bustime-response"]["error"]),
-                        ],
-                        ignore_index=True,
-                    )
-                new_data["scrape_file"] = obj_name
-                new_errors["scrape_file"] = obj_name
+        return len(data_dict)
 
-            data_list.append(new_data)
-            errors_list.append(new_errors)
+    def upload_s3_parquet(self, day):
+        # Upload the s3 file to s3.
+        # self.bucket.
+        date_str = day.to_date_string()
+        out_buffer = BytesIO()
+        self.dataset_df.to_parquet(out_buffer)
+        out_buffer.seek(0)
+        self.bucket.upload_fileobj(
+            out_buffer, f"processed/{self.data_type}/{date_str}.parquet"
+        )
+        return None
 
-        data = pd.concat(data_list, ignore_index=True)
-        errors = pd.concat(errors_list, ignore_index=True)
+    # Master function - fetches data - converts - saves as parquet - upload to s3, all looped one day at a time
+    def run(self, date_range):
+        """Master run"""
+        for day in date_range:
+            _ = self.fetch_s3_data(day)
+            self.decode_s3_data()
+            self.dataset_to_dataframe()
+            self.upload_s3_parquet(day)
 
-        logging.info(f"found {len(errors)} errors and {len(data)} data points for {date}")
 
-        if len(errors) > 0:
-            if save == "bucket":
-                error_key = f"bus_full_day_errors_v2/{date}.csv"
-                logging.info(f"saving errors to {bucket}/{error_key}")
-                bucket.put_object(
-                    Body=errors.to_csv(index=False),
-                    Key=error_key,
-                )
-            if save == "local":
-                local_filename = f"ghost_buses_full_day_errors_from_{bucket.name}_{date}.csv"
-                logging.info(f"saving errors to {local_filename}")
-                errors.to_csv(local_filename, index = False)
-        else:
-            logging.info(f"no errors found for {date}, not saving any error file")
+class VehiclePosition(GTFSdata):
+    def __init__(self):
+        self.data_type = "VehiclePosition"
+        self.field_types = [
+            field.name for field in gtfs_realtime_pb2._VEHICLEPOSITION.fields
+        ]
+        # self.sparse_cols_list = ['vehicle.trip.tripId',	'vehicle.trip.scheduleRelationship',	'vehicle.trip.routeId',	'vehicle.trip.directionId',	"vehicle.currentStatus",	'vehicle.stopId'] # Parquet does not like sparse dtypes
+        super().__init__()
 
-        if len(data) > 0:
-            # convert data time to actual datetime
-            data["data_time"] = pd.to_datetime(
-                    data["tmstmp"], format="%Y%m%d %H:%M"
-                )
 
-            data["data_hour"] = data.data_time.dt.hour
-            data["data_date"] = data.data_time.dt.date
-            if save == "bucket":
-                data_key = f"bus_full_day_data_v2/{date}.csv"
-                logging.info(f"saving data to {bucket}/{data_key}")
-                bucket.put_object(
-                    Body=data.to_csv(index=False),
-                    Key=data_key,
-                )
-            if save == "local":
-                local_filename = f"ghost_buses_full_day_data_from_{bucket.name}_{date}.csv"
-                logging.info(f"saving errors to {local_filename}")
-                data.to_csv(local_filename, index = False)
-        else:
-            logging.info(f"no data found for {date}, not saving any data file")
+class TripUpdate(GTFSdata):
+    def __init__(self):
+        self.data_type = "TripUpdate"
+        self.field_types = [
+            field.name for field in gtfs_realtime_pb2._TRIPUPDATE.fields
+        ]
+        # self.sparse_cols_list = ['tripUpdate.stopTimeUpdate',	'tripUpdate.vehicle.id',	'tripUpdate.vehicle.label'] # Parquet does not like sparse dtypes
+        super().__init__()
 
-    return data, errors
 
-def lambda_handler(event, context):
-    date = pendulum.yesterday("America/Chicago").to_date_string()
-    data, errors = combine_daily_files(date, [BUCKET_PRIVATE, BUCKET_PUBLIC], save = "bucket")
+class Alerts(GTFSdata):
+    def __init__(self):
+        self.data_type = "Alerts"
+        self.field_types = [field.name for field in gtfs_realtime_pb2._ALERT.fields]
+        super().__init__()
+
+
+if __name__ == "__main__":
+    # python combine_daily_files.py '2023-01-01' '2023-01-01' &
+    start_date = sys.argv[1]  #'2023-01-04' # YYYY-MM-DD
+    end_date = sys.argv[2]  # '2023-01-04' # YYYY-MM-DD
+
+    # start_date = '2023-01-04' # YYYY-MM-DD
+    # end_date = '2023-01-04' # YYYY-MM-DD
+
+    date_range = [
+        d
+        for d in pendulum.period(
+            pendulum.from_format(start_date, "YYYY-MM-DD"),
+            pendulum.from_format(end_date, "YYYY-MM-DD"),
+        ).range("days")
+    ]
+    print(date_range)
+    vp = VehiclePosition()
+    vp.run(date_range)
+    tu = TripUpdate()
+    tu.run(date_range)
+    alerts = Alerts()
+    alerts.run(date_range)
